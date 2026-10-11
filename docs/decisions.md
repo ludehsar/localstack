@@ -1,0 +1,16 @@
+# Decisions
+
+| Date | Decision | Choice | Why |
+|---|---|---|---|
+| 2026-10-11 | Host language and kernel substrate | C++20 + Objective-C++ for Metal calls; ggml via a pinned llama.cpp submodule for kernels, GGUF, tokenizer | Every Apple Silicon inference codebase worth reading is C/C++/Objective-C; the novel work is the memory tier, not GEMMs; a llama.cpp fork (discussion #23324) already ran this design on ggml's MoE kernel unchanged |
+| 2026-10-11 | First streaming target | Qwen3-30B-A3B (vanilla GQA + MoE, 128 experts, top-8) | Simplest graph; the #23324 PoC numbers on an M3 Pro calibrate the targets directly |
+| 2026-10-11 | Version 1 interface | CLI chat plus an OpenAI-compatible server | Usable from existing chat UIs; server is Phase 6 |
+| 2026-10-11 | Model storage | GGUF files in ~/Models/gguf, outside the repo | 31 GB of models must never be staged; shared with llama.cpp baselines |
+| 2026-10-11 | Dependency pinning | llama.cpp submodule pinned at the commit in docs/llama_cpp_commit.txt | ggml API churn; upgrade deliberately |
+| 2026-10-11 | Sampler order | repetition penalty, then greedy shortcut at temp 0, then temperature, top-k (nth_element), softmax over survivors, min-p, top-p, sample | llama.cpp's familiar order; top-k first keeps the per-token cost O(n) over a 152k vocabulary |
+| 2026-10-11 | KV cache layout | one [n_embd_gqa, kv_size] tensor per layer per K and V, cells allocated in 32-token blocks, per-cell (seq, pos) ownership, attention mask built from ownership over a dense view padded to 256 | llama.cpp's unified-cache approach; a sequence's blocks need not be contiguous, which is what the Phase 6 prefix cache and multi-session batching need |
+| 2026-10-11 | Chat turn feeding | re-apply the template to the whole history each turn and feed only the token suffix beyond what the KV already holds; full recompute if re-tokenized history diverges | general across templates; EOG token is fed into the KV so the next turn's suffix aligns |
+| 2026-10-11 | Expert storage for streaming v1 | read expert slices directly from the GGUF (3 preads per expert: up, gate, down) into one pool slot; no repacked copy | the repack would duplicate ~16 GB on a disk with 74 GB free; the mlx-lm study measured +14-18% for coalescing against a 9-read layout, so the gain over 3 reads is likely under 10%; Phase 5 measures it before paying the disk |
+| 2026-10-11 | Streaming graph structure | per-layer graph segments: experts of layer l, residual, attention and router of layer l+1 in one ggml graph; the CPU reads the routed ids, resolves slots, issues reads, then runs the next segment | exact inference needs the CPU to see routing before experts run; ggml's public API has no mid-graph GPU wait, so one segment boundary per layer (about 49 per token) is the minimum; event-based waits are a Phase 5 option |
+| 2026-10-11 | Server concurrency v1 | one request at a time behind a mutex, KV prefix reuse via truncate-to-common-prefix | continuous batching changes the engine step structure and must be evaluated with the streaming path on the real model; sequential serving already gives multi-turn reuse |
+| 2026-10-11 | Pool floor | a pool class never has fewer slots than one layer's expert count | a prefill batch can route to every expert of a layer; the pool must hold a full layer at once or prefill cannot run |
