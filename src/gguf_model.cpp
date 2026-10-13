@@ -1,3 +1,5 @@
+// gguf_model.cpp - GGUF metadata access and weight loading via pread into a backend buffer.
+
 #include "gguf_model.h"
 
 #include <fcntl.h>
@@ -17,6 +19,7 @@ bool GgufModel::open(const std::string &file, std::string &err) {
         err = "cannot open " + file;
         return false;
     }
+    // no_alloc = true: parse the header and build tensor descriptors in `meta` without reading the data.
     gguf_init_params params = { true, &meta };
     gguf = gguf_init_from_file(file.c_str(), params);
     if (!gguf) {
@@ -111,6 +114,7 @@ size_t GgufModel::loaded_bytes() const {
     return total;
 }
 
+// pread() until `size` bytes are read; false on error or EOF.
 static bool read_exact(int fd, void *dst, size_t size, off_t offset) {
     uint8_t *p = (uint8_t *) dst;
     while (size > 0) {
@@ -123,6 +127,8 @@ static bool read_exact(int fd, void *dst, size_t size, off_t offset) {
     return true;
 }
 
+// Duplicates each wanted tensor descriptor into `wctx`, allocates them all in one backend buffer,
+// then reads each tensor's bytes from the file.
 bool GgufModel::load_all(ggml_backend_t backend, std::string &err, const std::function<bool(const std::string &)> &skip) {
     const int64_t n = gguf_get_n_tensors(gguf);
     ggml_init_params wp = { ggml_tensor_overhead() * (size_t) (n + 1), nullptr, true };
@@ -149,6 +155,7 @@ bool GgufModel::load_all(ggml_backend_t backend, std::string &err, const std::fu
         }
         const size_t nbytes = ggml_nbytes(t);
         const off_t off = (off_t) (data_offset + gguf_get_tensor_offset(gguf, id));
+        // On unified memory the Metal buffer is CPU-visible, so read straight into it; otherwise stage and upload.
         if (ggml_backend_buffer_is_host(t->buffer)) {
             if (!read_exact(fd, t->data, nbytes, off)) {
                 err = std::string("short read for tensor ") + t->name;

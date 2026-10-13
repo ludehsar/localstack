@@ -1,4 +1,8 @@
+# CMake build tree (cmake -B build): the lstk binary, ggml/llama libraries, hand-built tools.
 build/
+# Model weights. GGUF files are gigabytes and live in ~/Models/gguf, never in the repo.
 models/
 *.gguf
+# macOS Finder metadata.
 .DS_Store
+.cache/

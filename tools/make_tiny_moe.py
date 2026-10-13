@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
+"""Write a tiny random Qwen3-MoE GGUF file for fast engine tests.
+
+The real MoE model is 12-18 GB; this one is about 200 KB with the same tensor names, layout,
+and metadata keys, so tools/test_streaming.sh can check the expert-streaming path in seconds.
+Weights are random (outputs are gibberish); norms are 1. Expert tensors are Q8_0 so the streamed
+path reads real quantized blocks. The GGUF v3 writer is hand-rolled to avoid a gguf-py dependency.
+
+    python3 tools/make_tiny_moe.py tiny.gguf [--layers 2 --experts 8 --used 2 ...]
+"""
 import argparse
 import random
 import struct
 
+# GGUF metadata value type ids and ggml tensor type ids (from gguf.h / ggml.h).
 GGUF_UINT32, GGUF_FLOAT32, GGUF_BOOL, GGUF_STRING, GGUF_ARRAY, GGUF_UINT64 = 4, 6, 7, 8, 9, 10
 GGML_F32, GGML_F16, GGML_Q8_0 = 0, 1, 8
 
@@ -11,6 +21,7 @@ def f16_bytes(values):
     return struct.pack("<%de" % len(values), *values)
 
 
+# Q8_0 quantization: blocks of 32 values stored as one fp16 scale d = max|v| / 127 plus 32 int8 values.
 def q8_0_bytes(values):
     out = bytearray()
     for i in range(0, len(values), 32):
@@ -23,6 +34,8 @@ def q8_0_bytes(values):
     return bytes(out)
 
 
+# Minimal GGUF v3 writer. File layout: magic "GGUF", version, tensor count, KV count; the KV pairs;
+# the tensor index (name, dims, type, offset); padding to 32 bytes; then each tensor's data, 32-byte aligned.
 class Writer:
     def __init__(self):
         self.kv = []
@@ -106,6 +119,7 @@ def main():
     w.add_u32(arch + ".expert_used_count", a.used)
     w.add_u32(arch + ".expert_feed_forward_length", a.ff_exp)
 
+    # Tensor shapes are in ggml order (innermost dimension first), matching what src/qwen3.cpp expects.
     w.add_tensor("token_embd.weight", [a.embd, a.vocab], GGML_F16, f16_bytes(gauss(a.embd * a.vocab, 0.1)))
     w.add_tensor("output_norm.weight", [a.embd], GGML_F32, struct.pack("<%df" % a.embd, *([1.0] * a.embd)))
     for l in range(a.layers):

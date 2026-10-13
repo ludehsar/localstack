@@ -1,4 +1,16 @@
 #!/bin/sh
+# End-to-end check of the streaming engine on a real MoE GGUF; writes a report to docs/runs/<model>.md.
+#
+#   ./tools/moe_check.sh ~/Models/gguf/Qwen3-30B-A3B-UD-Q4_K_XL.gguf [output_dir]
+#
+# Steps:
+#   1. Self-consistency: greedy runs with a 1 GiB and a 2.5 GiB expert pool must produce identical
+#      top logits (pool size changes which experts are cached, never the math).
+#   2. Routing trace of 200 sampled tokens, replayed through tools/cache_sim.py.
+#   3. Decode speed with 1, 2, 3, and 4 GiB pools.
+#   4. Only when about 13 GiB is free: the resident (all experts in RAM) run and llama-bench baseline.
+#
+# Needs build/lstk and build/tools/gguf_info (see tools/gguf_info.c for its compile line).
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 M="$1"
@@ -8,10 +20,30 @@ NAME=$(basename "$M" .gguf)
 LOG="$OUT/$NAME.md"
 TMP="${TMPDIR:-/tmp}/moe_check_$$"
 mkdir -p "$TMP"
+# Drop ggml/llama.cpp loader log lines from captured output.
 FILTER='^ggml_metal|^load|^print_info|^llama_model_loader|^init|^llama_|^graph_|^\s*$'
+# Available memory in GiB: (free + inactive pages) x 16 KiB pages.
 AVAIL=$(vm_stat | awk '/Pages free/{f=$3} /Pages inactive/{i=$3} END{gsub(/\./,"",f); gsub(/\./,"",i); printf "%.1f", (f+i)*16384/1073741824}')
 PROMPT="Explain in detail how a hash map handles collisions, and compare chaining with open addressing."
+# run ARGS...: lstk on the model with a 2048-token context, logs filtered.
 run() { "$HERE/build/lstk" --model "$M" --n-ctx 2048 "$@" 2>&1 | grep -vE "$FILTER"; }
+
+if [ ! -f "$M" ]; then
+    echo "no such file: $M"
+    exit 1
+fi
+# Refuse partial downloads and non-MoE files before spending minutes on runs.
+PROBE=$("$HERE/build/tools/gguf_info" "$M" --filter general.architecture 2>&1 | grep -E "general.architecture|failed")
+case "$PROBE" in
+    *qwen3moe*) ;;
+    *failed*|"") echo "cannot read $M as a GGUF (still downloading?)"; exit 1 ;;
+    *) echo "not a MoE model: $PROBE"; exit 1 ;;
+esac
+SIZE=$(stat -f %z "$M")
+if [ "$SIZE" -lt 10000000000 ]; then
+    echo "$M is only $SIZE bytes; the download looks incomplete"
+    exit 1
+fi
 
 {
     echo "# $NAME"
@@ -26,7 +58,14 @@ run() { "$HERE/build/lstk" --model "$M" --n-ctx 2048 "$@" 2>&1 | grep -vE "$FILT
     echo "--- pool 2.5 GiB ---"
     grep -E "^experts|^prompt:" "$TMP/b.txt"
     echo '```'
-    if diff <(grep -E "^top" "$TMP/a.txt") <(grep -E "^top" "$TMP/b.txt") > /dev/null; then
+    grep -E "^top" "$TMP/a.txt" > "$TMP/a_top.txt"
+    grep -E "^top" "$TMP/b.txt" > "$TMP/b_top.txt"
+    if [ ! -s "$TMP/a_top.txt" ]; then
+        echo "Result: FAIL, no logits produced:"
+        grep -E "^error" "$TMP/a.txt"
+        exit 1
+    fi
+    if cmp -s "$TMP/a_top.txt" "$TMP/b_top.txt"; then
         echo "Result: top logits identical across pool sizes ($(grep -c '^top' "$TMP/a.txt") rows): PASS"
     else
         echo "Result: top logits DIFFER across pool sizes: FAIL"
@@ -52,7 +91,7 @@ run() { "$HERE/build/lstk" --model "$M" --n-ctx 2048 "$@" 2>&1 | grep -vE "$FILT
         run --bench 64 48 --stream-experts --pool-gib "$POOL" | grep -E "^bench|^experts: [0-9]|^memory pressure"
     done
     echo '```'
-    if [ "$(echo "$AVAIL >= 13" | bc)" = "1" ]; then
+    if [ "$(printf '%s\n' "$AVAIL" | awk '{print ($1 >= 13) ? 1 : 0}')" = "1" ]; then
         echo
         echo "## Resident (all experts in RAM) and llama.cpp baseline"
         echo '```'

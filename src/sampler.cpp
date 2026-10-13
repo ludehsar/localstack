@@ -1,3 +1,5 @@
+// sampler.cpp - next-token sampling. The order of steps is documented in docs/decisions.md.
+
 #include "sampler.h"
 
 #include <algorithm>
@@ -17,14 +19,17 @@ void Sampler::accept(int32_t token) {
 
 int32_t Sampler::sample(std::vector<float> &logits) {
     const int n = (int) logits.size();
+    // Repetition penalty (CTRL-style): shrink recently seen tokens' logits toward "less likely" whatever their sign.
     if (params.repeat_penalty != 1.0f) {
         for (int32_t t : recent) {
             float &l = logits[t];
             l = l > 0 ? l / params.repeat_penalty : l * params.repeat_penalty;
         }
     }
+    // Temperature 0: greedy, skip the rest.
     if (params.temperature <= 0.0f) return (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());
 
+    // Top-k with nth_element is O(n_vocab); only the k survivors are fully sorted.
     std::vector<int32_t> cand(n);
     std::iota(cand.begin(), cand.end(), 0);
     auto greater = [&](int32_t a, int32_t b) { return logits[a] > logits[b]; };
@@ -36,6 +41,7 @@ int32_t Sampler::sample(std::vector<float> &logits) {
     cand.resize(keep);
     std::sort(cand.begin(), cand.end(), greater);
 
+    // Softmax with temperature over the survivors (subtract the max for numerical stability).
     std::vector<float> probs(keep);
     const float max_logit = logits[cand[0]];
     double sum = 0.0;
@@ -45,6 +51,7 @@ int32_t Sampler::sample(std::vector<float> &logits) {
     }
     for (float &p : probs) p = (float) (p / sum);
 
+    // min-p and top-p truncate the sorted list; at least one token always survives.
     int cut = keep;
     if (params.min_p > 0.0f) {
         const float floor = params.min_p * probs[0];
@@ -62,6 +69,7 @@ int32_t Sampler::sample(std::vector<float> &logits) {
         }
         cut = std::max(1, std::min(cut, i));
     }
+    // Draw from the remaining (unnormalized) distribution by walking its cumulative sum.
     double total = 0.0;
     for (int i = 0; i < cut; i++) total += probs[i];
     std::uniform_real_distribution<double> dist(0.0, total);

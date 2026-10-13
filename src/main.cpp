@@ -1,3 +1,14 @@
+// main.cpp - the lstk command-line entry point.
+//
+// Parses flags, loads the tokenizer and the Engine, then runs one mode:
+//   (default)      complete --prompt, optionally comparing every step against llama.cpp (--parity)
+//   --chat         interactive multi-turn chat in the terminal
+//   --serve        OpenAI-compatible HTTP server (server.cpp)
+//   --bench P G    prompt-processing and generation speed
+//   --dump-ref     run llama.cpp alone and record its logits (no Engine is loaded)
+//   --compare-ref  replay a --dump-ref file through the Engine and report the logit differences
+// Afterwards it prints memory-pressure and expert-cache statistics.
+
 #include "engine.h"
 #include "memory_monitor.h"
 #include "sampler.h"
@@ -15,8 +26,10 @@
 #include <string>
 #include <vector>
 
+// Defined in metal_info.mm.
 extern "C" uint64_t lstk_metal_recommended_working_set(void);
 
+// Parsed command-line options; see usage() for meanings and defaults.
 struct Args {
     std::string model;
     std::string prompt = "The capital of France is";
@@ -126,6 +139,7 @@ static bool parse_args(int argc, char **argv, Args &a) {
 
 static bool g_verbose = false;
 
+// ggml/llama.cpp log hook: only warnings and errors unless --verbose.
 static void quiet_log(ggml_log_level level, const char *text, void *) {
     if (g_verbose || level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN) fputs(text, stderr);
 }
@@ -134,6 +148,7 @@ static int argmax(const float *v, int n) {
     return (int) (std::max_element(v, v + n) - v);
 }
 
+// Prints the n highest logits as id:value (used by --print-logits and the streaming tests).
 static void print_top(const std::vector<float> &logits, int n) {
     std::vector<int> idx(logits.size());
     for (size_t i = 0; i < idx.size(); i++) idx[i] = (int) i;
@@ -144,6 +159,8 @@ static void print_top(const std::vector<float> &logits, int n) {
     printf("\n");
 }
 
+// Writes token pieces to stdout as they arrive, holding back a trailing incomplete UTF-8 character
+// until the next piece completes it.
 struct Utf8Printer {
     std::string pending;
     void write(const std::string &piece) {
@@ -167,6 +184,7 @@ struct Utf8Printer {
     }
 };
 
+// How far our logits are from the reference: max and RMS absolute difference, and both argmaxes.
 struct Diff {
     double max_abs = 0.0;
     double rms = 0.0;
@@ -193,6 +211,7 @@ static void report(const char *label, const Diff &d) {
            d.ref_arg == d.our_arg ? "MATCH" : "MISMATCH");
 }
 
+// llama.cpp's own implementation of the same model, run in-process as ground truth for correctness checks.
 struct RefModel {
     llama_model *model = nullptr;
     llama_context *ctx = nullptr;
@@ -221,8 +240,11 @@ struct RefModel {
     }
 };
 
+// Reference file format: "LSTKREF1", int32 n_vocab, n_steps, n_prompt, n_prompt prompt token ids,
+// then per step: int32 greedy next token, float[n_vocab] logits.
 static const char REF_MAGIC[8] = { 'L', 'S', 'T', 'K', 'R', 'E', 'F', '1' };
 
+// --dump-ref: greedy-decode with llama.cpp and record every step's logits.
 static int run_dump_ref(const Args &a, Tokenizer &tok) {
     RefModel ref;
     if (!ref.load(a)) {
@@ -260,6 +282,8 @@ static int run_dump_ref(const Args &a, Tokenizer &tok) {
     return 0;
 }
 
+// --compare-ref: feed the recorded prompt and the recorded greedy tokens through our Engine, so both
+// implementations see identical inputs, and compare logits at every step.
 static int run_compare_ref(const Args &a, Tokenizer &tok, Engine &engine) {
     FILE *f = fopen(a.compare_ref.c_str(), "rb");
     char magic[8];
@@ -311,6 +335,8 @@ static int run_compare_ref(const Args &a, Tokenizer &tok, Engine &engine) {
     return 0;
 }
 
+// --bench: warm up (first Metal pipeline compiles are slow), then time P prompt tokens and G greedy
+// tokens. The prompt is synthetic but deterministic token ids spread across the vocabulary.
 static int run_bench(const Args &a, Engine &engine) {
     std::string err;
     std::vector<float> logits;
@@ -342,6 +368,9 @@ static int run_bench(const Args &a, Engine &engine) {
     return 0;
 }
 
+// --chat: each turn re-applies the chat template to the whole history and feeds only the tokens
+// beyond what the KV cache already holds. If the re-tokenized history diverges from what was fed,
+// the cache is cleared and the whole history recomputed.
 static int run_chat(const Args &a, Tokenizer &tok, Engine &engine) {
     std::vector<std::pair<std::string, std::string>> msgs;
     if (!a.system.empty()) msgs.push_back({ "system", a.system });
@@ -399,6 +428,7 @@ static int run_chat(const Args &a, Tokenizer &tok, Engine &engine) {
             const int32_t next = sampler.sample(logits);
             sampler.accept(next);
             fed.push_back(next);
+            // Feed the EOG token so the KV matches the template's end-of-turn marker next turn.
             if (tok.is_eog(next)) {
                 engine.decode(0, &next, 1, logits, err);
                 break;
@@ -444,6 +474,7 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    // Everything below needs our Engine.
     EngineParams ep;
     ep.model_path = args.model;
     ep.n_ctx = args.n_ctx;
@@ -496,6 +527,8 @@ int main(int argc, char **argv) {
     } else if (args.chat) {
         rc = run_chat(args, tok, engine);
     } else {
+        // Default mode: single-shot completion. With --parity, decoding is greedy and follows llama.cpp's
+        // choice at each step so the two runs stay on the same token sequence.
         std::vector<int32_t> prompt = raw ? args.tokens : tok.encode(args.prompt, true, true);
         if (prompt.empty()) {
             fprintf(stderr, "error: empty prompt\n");

@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
+"""Replay an MoE routing trace against expert-cache replacement policies.
+
+Answers "how big must the expert pool be, and which eviction policy should it use?" before
+building it. Input is a trace written by `lstk --trace-routing FILE` (format in src/engine.cpp).
+Each layer is simulated as its own cache of `cap` expert slots, compared across:
+
+  LRU        evict the least recently used expert (what src/expert_store.cpp implements)
+  LFU-decay  evict the expert with the lowest exponentially decayed use count
+  Belady     evict the expert used furthest in the future; needs the future, so it is the
+             offline upper bound no real policy can beat
+
+Estimated tokens/s = 1000 / (compute_ms + misses_per_token * miss_ms), a simple cost model fed
+with SSD numbers from tools/ssd_bench.c.
+
+    python3 tools/cache_sim.py trace.bin [--fractions 0.25,0.5] [--miss-ms 0.67] [--compute-ms 20]
+"""
 import argparse
 import collections
 import struct
 import sys
 
 
+# Returns per_layer[l] = list of expert-id tuples, one per token, skipping rows of -1 (not computed).
+# A truncated final step (trace written while the run was killed) is dropped.
 def read_trace(path):
     with open(path, "rb") as f:
         magic = f.read(8)
@@ -34,6 +52,7 @@ def read_trace(path):
     return n_layer, n_expert, k, per_layer
 
 
+# Each sim_* returns the hit count for one layer's sequence of top-k expert sets.
 def sim_lru(seq, cap):
     cache = collections.OrderedDict()
     hits = 0
@@ -68,6 +87,7 @@ def sim_lfu_decay(seq, cap, decay=0.98):
     return hits
 
 
+# Precompute, for every access, when the same expert is next used; evict the one with the furthest next use.
 def sim_belady(seq, cap):
     flat = [e for experts in seq for e in experts]
     next_use = [None] * len(flat)
@@ -101,6 +121,7 @@ def main():
     loads_per_token = n_layer * k
     print("layers=%d experts=%d top_k=%d tokens=%d expert loads per token=%d" % (n_layer, n_expert, k, n_tok, loads_per_token))
 
+    # Locality statistics: how many experts consecutive tokens share, and how skewed expert popularity is.
     overlap = 0.0
     counts = collections.Counter()
     for seq in per_layer:

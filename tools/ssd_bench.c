@@ -1,3 +1,16 @@
+// ssd_bench.c - measure SSD read throughput the way expert streaming will read.
+//
+// Expert misses become random positioned reads of a few MiB each, so this measures:
+//   cold random reads   by chunk size (1-16 MiB) x thread count (1-16), bypassing the page cache
+//   cold sequential     16 MiB chunks, one thread, for comparison
+//   warm single reads   from the page cache, 16 KiB- vs 2 MiB-aligned destination buffers
+//   warm parallel reads from the page cache, by thread count
+// Results drove the I/O thread count, buffer alignment, and the --miss-ms cost in tools/cache_sim.py
+// (see docs/baseline.md). Use a large file (e.g. a GGUF) that has not been read recently.
+//
+//   cc -O2 tools/ssd_bench.c -o build/tools/ssd_bench
+//   build/tools/ssd_bench FILE [MiB_per_config=256] [warm_iters=64]
+
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -10,6 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
+// Per-thread state: threads claim offsets from a shared atomic counter until all are read.
 typedef struct {
     int fd;
     size_t chunk;
@@ -51,6 +65,7 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+// xorshift64* PRNG: fast, deterministic offsets without libc rand().
 static uint64_t rng_state = 0x9E3779B97F4A7C15ull;
 
 static uint64_t rng_next(void) {
@@ -62,6 +77,8 @@ static uint64_t rng_next(void) {
     return x * 0x2545F4914F6CDD1Dull;
 }
 
+// True if no page of the chunk is in the page cache (mincore on an mmap of the file), so a read
+// truly hits the SSD. Reads through fd_cold use F_NOCACHE, so they do not warm the cache either.
 static int chunk_is_cold(const char *map, size_t file_size, off_t off, size_t chunk, size_t page) {
     size_t len = chunk;
     if ((size_t)off + len > file_size) len = file_size - (size_t)off;
@@ -74,6 +91,7 @@ static int chunk_is_cold(const char *map, size_t file_size, off_t off, size_t ch
     return 1;
 }
 
+// Random page-aligned offsets whose chunks are cold, up to `want` of them.
 static size_t pick_cold_offsets(const char *map, size_t file_size, size_t chunk, size_t page, off_t *out, size_t want) {
     size_t got = 0, tries = 0;
     size_t slots = (file_size - chunk) / page;
@@ -85,6 +103,7 @@ static size_t pick_cold_offsets(const char *map, size_t file_size, size_t chunk,
     return got;
 }
 
+// Reads all offsets with `threads` threads; returns wall seconds, total bytes, and the slowest single read.
 static double run_parallel(int fd, size_t chunk, size_t align, int threads, const off_t *offsets, size_t n,
                            size_t *bytes_out, double *max_ms_out) {
     pthread_t tids[threads];
@@ -124,6 +143,7 @@ int main(int argc, char **argv) {
     struct stat st;
     fstat(fd_cold, &st);
     size_t file_size = (size_t)st.st_size;
+    // Two descriptors: fd_cold bypasses the unified buffer cache; fd_warm (and the mmap) go through it.
     if (fcntl(fd_cold, F_NOCACHE, 1) != 0) perror("F_NOCACHE");
     char *map = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd_warm, 0);
     if (map == MAP_FAILED) {

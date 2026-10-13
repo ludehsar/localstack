@@ -1,3 +1,5 @@
+// memory_monitor.cpp - macOS memory statistics from Mach (host_statistics64) and sysctl.
+
 #include "memory_monitor.h"
 
 #include <mach/mach.h>
@@ -9,6 +11,7 @@ bool memory_snapshot(MemorySnapshot &out) {
     vm_statistics64_data_t vm;
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
     if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) return false;
+    // VM counters are in pages (16 KiB on Apple Silicon).
     const uint64_t page = (uint64_t) vm_kernel_page_size;
     uint64_t memsize = 0;
     size_t len = sizeof(memsize);
@@ -35,6 +38,7 @@ std::string memory_describe(const MemorySnapshot &s) {
     return buf;
 }
 
+// Sustained decompressions or swap-ins per second mean the working set does not fit in RAM.
 std::string memory_pressure_delta(const MemorySnapshot &before, const MemorySnapshot &after, double seconds) {
     char buf[256];
     const double secs = seconds > 0 ? seconds : 1.0;

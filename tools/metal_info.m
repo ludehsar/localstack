@@ -1,3 +1,10 @@
+// metal_info.m - print the Metal GPU limits that bound how much model fits on the GPU.
+//
+// Most important: recommendedMaxWorkingSetSize, the memory macOS lets the GPU keep resident.
+// Weights, KV cache, and expert pool must all fit under it. Results are in docs/baseline.md.
+//
+//   clang -O2 -fobjc-arc -framework Foundation -framework Metal tools/metal_info.m -o build/tools/metal_info
+
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <stdio.h>

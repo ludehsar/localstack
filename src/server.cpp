@@ -1,3 +1,11 @@
+// server.cpp - OpenAI-compatible chat completions over HTTP (cpp-httplib + nlohmann/json, both vendored
+// in llama.cpp).
+//
+// Concurrency: one generation at a time. A Generation holds the shared mutex for its whole life,
+// including across streaming callbacks, so other requests wait. All requests share KV sequence 0;
+// `Shared::fed` mirrors the tokens in it, so a new request whose prompt starts with the same tokens
+// (a multi-turn chat resending its history) only processes the new suffix.
+
 #include "server.h"
 
 #include "cpp-httplib/httplib.h"
@@ -14,17 +22,20 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
+// State shared by all requests: the engine, the mutex that serializes them, and the cached token prefix.
 struct Shared {
     Tokenizer &tok;
     Engine &engine;
     const ServerParams &params;
     std::mutex mutex;
+    // Exactly the tokens currently held in KV sequence 0.
     std::vector<int32_t> fed;
     std::atomic<uint64_t> counter{ 0 };
     std::string model_name;
     Shared(Tokenizer &t, Engine &e, const ServerParams &p) : tok(t), engine(e), params(p), model_name(t.model_name()) {}
 };
 
+// Length of `s` without a trailing incomplete UTF-8 character, so streamed chunks never split a character.
 size_t utf8_safe_len(const std::string &s) {
     for (size_t back = 1; back <= 4 && back <= s.size(); back++) {
         const unsigned char c = (unsigned char) s[s.size() - back];
@@ -35,6 +46,7 @@ size_t utf8_safe_len(const std::string &s) {
     return s.size();
 }
 
+// One in-flight completion: holds the lock, sampler, current logits, and the reply text generated so far.
 struct Generation {
     std::shared_ptr<Shared> sh;
     std::unique_lock<std::mutex> lock;
@@ -45,6 +57,7 @@ struct Generation {
     int max_tokens = 0;
     std::vector<std::string> stops;
     std::string reply;
+    // Bytes of `reply` already sent to the client.
     size_t emitted = 0;
     int generated = 0;
     int prompt_tokens = 0;
@@ -56,6 +69,8 @@ struct Generation {
 
     Generation(std::shared_ptr<Shared> s, const SamplerParams &sp) : sh(std::move(s)), lock(sh->mutex), sampler(sp) {}
 
+    // Length of the longest tail of `reply` that is a prefix of some stop string. That text is held back
+    // from streaming because, if the stop string completes, it must not appear in the output.
     size_t held_suffix() const {
         size_t held = 0;
         for (const std::string &stop : stops) {
@@ -69,6 +84,7 @@ struct Generation {
         return held;
     }
 
+    // Finds a complete stop string, searching only near the unsent tail (text before it was already checked).
     bool stop_hit(size_t &cut) const {
         size_t from = emitted > 64 ? emitted - 64 : 0;
         for (const std::string &stop : stops) {
@@ -82,6 +98,7 @@ struct Generation {
         return false;
     }
 
+    // Returns the next chunk of `reply` that is safe to send (everything, if final).
     std::string drain(bool final) {
         size_t limit = final ? reply.size() : std::min(utf8_safe_len(reply), reply.size() - held_suffix());
         if (limit < emitted) limit = emitted;
@@ -90,6 +107,8 @@ struct Generation {
         return out;
     }
 
+    // Samples one token and feeds it to the engine. Sets finished on EOG, a stop string, or max_tokens.
+    // `delta` gets the newly sendable text.
     bool step(std::string &delta, std::string &err) {
         delta.clear();
         if (finished) return true;
@@ -98,6 +117,7 @@ struct Generation {
         sampler.accept(next);
         sh->fed.push_back(next);
         if (sh->tok.is_eog(next)) {
+            // Feed the EOG token into the KV too, so the next request's templated history lines up with `fed`.
             engine.decode(0, &next, 1, logits, err);
             finished = true;
             finish_reason = "stop";
@@ -131,6 +151,7 @@ struct Generation {
     }
 };
 
+// OpenAI message content is either a string or an array of parts; keep only the text parts.
 std::string content_text(const json &content) {
     if (content.is_string()) return content.get<std::string>();
     std::string out;
@@ -142,6 +163,8 @@ std::string content_text(const json &content) {
     return out;
 }
 
+// Validates the request, applies per-request sampling overrides, templates and tokenizes the messages,
+// reuses the cached KV prefix, and runs the prompt so `g.logits` is ready for the first sample.
 bool prepare(Generation &g, const json &body, std::string &error) {
     Shared &sh = *g.sh;
     std::vector<std::pair<std::string, std::string>> msgs;
@@ -186,6 +209,8 @@ bool prepare(Generation &g, const json &body, std::string &error) {
     }
     if ((int) (sh.params.n_ctx - tokens.size() - 1) < g.max_tokens) g.max_tokens = (int) (sh.params.n_ctx - tokens.size() - 1);
 
+    // KV prefix reuse: keep the longest common prefix, drop the rest. If the whole prompt is already cached,
+    // back off one token: decoding it again is what produces the logits to sample from.
     size_t common = 0;
     while (common < sh.fed.size() && common < tokens.size() && sh.fed[common] == tokens[common]) common++;
     if (common == tokens.size()) common = tokens.size() - 1;
@@ -237,6 +262,7 @@ void error_response(httplib::Response &res, int status, const std::string &messa
 
 } // namespace
 
+// Routes: CORS preflight, /health, /v1/models, /v1/chat/completions.
 int run_server(const ServerParams &params, Tokenizer &tok, Engine &engine) {
     auto sh = std::make_shared<Shared>(tok, engine, params);
     httplib::Server svr;
@@ -285,6 +311,8 @@ int run_server(const ServerParams &params, Tokenizer &tok, Engine &engine) {
             res.set_content(out.dump(), "application/json");
             return;
         }
+        // Streaming: httplib calls this provider repeatedly; each call generates one token and sends its text as an
+        // SSE "data:" chunk. The first chunk announces the assistant role; the last carries finish_reason and usage.
         auto first = std::make_shared<bool>(true);
         res.set_chunked_content_provider("text/event-stream", [g, first](size_t, httplib::DataSink &sink) {
             auto send = [&](const json &j) {

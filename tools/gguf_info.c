@@ -1,7 +1,17 @@
+// gguf_info.c - dump a GGUF file's header, metadata keys, and (with --tensors) its tensor index.
+//
+// Used to inspect models (hyperparameter key names, quant type per tensor, byte offsets of expert
+// tensors) and by tools/moe_check.sh to check that a download is a readable qwen3moe file.
+//
+//   cc -O2 -I third_party/llama.cpp/ggml/include tools/gguf_info.c -L build/bin -lggml-base \
+//      -Wl,-rpath,"$PWD/build/bin" -o build/tools/gguf_info        # after building lstk
+//   build/tools/gguf_info model.gguf [--tensors] [--filter substring]
+
 #include "gguf.h"
 #include <stdio.h>
 #include <string.h>
 
+// Prints one metadata entry as key, type, value (long strings truncated, arrays as type and length).
 static void print_kv(const struct gguf_context *g, int64_t i) {
     const char *key = gguf_get_key(g, i);
     enum gguf_type t = gguf_get_kv_type(g, i);
@@ -42,6 +52,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--tensors")) show_tensors = 1;
         else if (!strcmp(argv[i], "--filter") && i + 1 < argc) filter = argv[++i];
     }
+    // no_alloc = 1: read only the header and index, never the tensor data.
     struct gguf_init_params p = { 1, NULL };
     struct gguf_context *g = gguf_init_from_file(argv[1], p);
     if (!g) {

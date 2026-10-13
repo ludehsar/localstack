@@ -1,3 +1,7 @@
+# llama.cpp is vendored as a submodule. We use its ggml library (tensors, graph scheduler,
+# Metal kernels), its GGUF reader, its tokenizer and chat templates, and the full llama.cpp
+# model as an in-process reference for --parity / --dump-ref. The pinned commit is recorded in
+# docs/llama_cpp_commit.txt; ggml's API changes often, so upgrade deliberately.
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
 	url = https://github.com/ggml-org/llama.cpp

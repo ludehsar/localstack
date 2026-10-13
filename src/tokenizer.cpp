@@ -1,3 +1,7 @@
+// tokenizer.cpp - thin wrappers over llama.cpp's vocabulary and chat-template API.
+// llama.cpp functions return a negative count when the output buffer is too small; each wrapper
+// then resizes to that size and retries.
+
 #include "tokenizer.h"
 
 Tokenizer::~Tokenizer() {
@@ -6,6 +10,7 @@ Tokenizer::~Tokenizer() {
 
 bool Tokenizer::load(const std::string &path, std::string &err) {
     llama_model_params mp = llama_model_default_params();
+    // Load only the tokenizer metadata, not the multi-GB weights (the Engine loads those itself).
     mp.vocab_only = true;
     model = llama_model_load_from_file(path.c_str(), mp);
     if (!model) {
@@ -56,6 +61,7 @@ std::string Tokenizer::model_name() const {
 }
 
 std::string Tokenizer::apply_template(const std::vector<std::pair<std::string, std::string>> &msgs, bool add_assistant) const {
+    // Use the template stored in the GGUF; fall back to ChatML (the format Qwen uses) if it is missing or unsupported.
     const char *tmpl = llama_model_chat_template(model, nullptr);
     if (!tmpl) tmpl = "chatml";
     std::vector<llama_chat_message> cm;

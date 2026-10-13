@@ -1,3 +1,6 @@
+// expert_store.cpp - expert pool allocation, LRU replacement, and parallel SSD reads.
+// See expert_store.h for the design overview.
+
 #include "expert_store.h"
 
 #include <unistd.h>
@@ -40,6 +43,8 @@ void IoPool::wait_all() {
     done_.wait(lock, [this] { return pending_ == 0; });
 }
 
+// Worker loop: pop a task, pread() it fully (pread may return short counts), mark it done.
+// ponytail: a failed read is only logged; the slot then holds garbage. Propagate an error flag if this ever fires.
 void IoPool::worker() {
     for (;;) {
         IoTask task;
@@ -84,12 +89,15 @@ ExpertStore::~ExpertStore() {
     if (ctx_) ggml_free(ctx_);
 }
 
+// 2 MiB alignment: Metal needs page-aligned memory to wrap it without copying, and tools/ssd_bench.c
+// measured 2 MiB-aligned read destinations 34% faster than 16 KiB-aligned ones (docs/baseline.md).
 static void *alloc_pages(size_t bytes) {
     void *p = nullptr;
     if (posix_memalign(&p, 2u << 20, bytes) != 0) return nullptr;
     return p;
 }
 
+// Round up to the 16 KiB Apple Silicon page size (required by buffer_from_host_ptr).
 static size_t page_round(size_t bytes) {
     const size_t page = 16384;
     return (bytes + page - 1) / page * page;
@@ -105,12 +113,27 @@ bool ExpertStore::init(ggml_backend_dev_t dev, ggml_backend_t backend, int fd, u
     layer_pool_.assign(n_layer, -1);
     slot_of_.assign((size_t) n_layer * n_expert, -1);
 
-    std::map<std::tuple<int, int, int>, int> classes;
+    // Group layers by their (up, gate, down) quant types. Unsloth's dynamic quants mix types across
+    // layers, and one pool tensor can only have one type.
+    std::map<std::tuple<int, int, int>, std::vector<int>> classes;
     for (uint32_t l = 0; l < n_layer; l++) {
         const ExpertLayerInfo &li = layers[l];
-        auto key = std::make_tuple((int) li.up.type, (int) li.gate.type, (int) li.down.type);
-        auto it = classes.find(key);
-        if (it == classes.end()) {
+        classes[std::make_tuple((int) li.up.type, (int) li.gate.type, (int) li.down.type)].push_back((int) l);
+    }
+    if (min_slots > kMaxSlotsPerPool) {
+        err = "expert pool floor of " + std::to_string(min_slots) + " slots exceeds the Metal limit of " +
+              std::to_string(kMaxSlotsPerPool) + " experts per tensor";
+        return false;
+    }
+    // Each class gets its share of pool_bytes in proportion to its layer count. If that share needs
+    // more than 1024 slots, split the class's layers into shards that each fit under the Metal limit.
+    for (auto &[key, ls] : classes) {
+        const ExpertLayerInfo &li = layers[ls[0]];
+        const size_t slab = li.up.expert_stride() + li.gate.expert_stride() + li.down.expert_stride();
+        const size_t want = std::max<size_t>(min_slots, pool_bytes * ls.size() / n_layer / slab);
+        const size_t n_shards = (want + kMaxSlotsPerPool - 1) / kMaxSlotsPerPool;
+        const size_t per = (ls.size() + n_shards - 1) / n_shards;
+        for (size_t i = 0; i < ls.size(); i += per) {
             ExpertPool p;
             p.tu = li.up.type;
             p.tg = li.gate.type;
@@ -118,20 +141,19 @@ bool ExpertStore::init(ggml_backend_dev_t dev, ggml_backend_t backend, int fd, u
             p.up_bytes = li.up.expert_stride();
             p.gate_bytes = li.gate.expert_stride();
             p.down_bytes = li.down.expert_stride();
+            p.layers.assign(ls.begin() + (long) i, ls.begin() + (long) std::min(i + per, ls.size()));
+            const size_t share = pool_bytes * p.layers.size() / n_layer;
+            p.n_slots = (uint32_t) std::min<size_t>(kMaxSlotsPerPool, std::max<size_t>(min_slots, share / slab));
+            for (int l : p.layers) layer_pool_[l] = (int) pools_.size();
             pools_.push_back(p);
-            it = classes.emplace(key, (int) pools_.size() - 1).first;
         }
-        pools_[it->second].layers.push_back((int) l);
-        layer_pool_[l] = it->second;
     }
 
+    // Allocate each pool's memory, expose it to Metal zero-copy, and create the slot-indexed tensors.
     ggml_init_params gp = { ggml_tensor_overhead() * 3 * pools_.size() + 1024, nullptr, true };
     ctx_ = ggml_init(gp);
 
     for (ExpertPool &p : pools_) {
-        const size_t slab = p.up_bytes + p.gate_bytes + p.down_bytes;
-        const size_t share = pool_bytes * p.layers.size() / n_layer;
-        p.n_slots = (uint32_t) std::max<size_t>(min_slots, share / slab);
         p.bytes_up = page_round(p.up_bytes * p.n_slots);
         p.bytes_gate = page_round(p.gate_bytes * p.n_slots);
         p.bytes_down = page_round(p.down_bytes * p.n_slots);
@@ -168,12 +190,14 @@ bool ExpertStore::init(ggml_backend_dev_t dev, ggml_backend_t backend, int fd, u
         p.refcount.assign(p.n_slots, 0);
         p.prev.assign(p.n_slots, -1);
         p.next.assign(p.n_slots, -1);
+        // All slots start empty and unpinned, so all are eviction candidates.
         for (uint32_t s = 0; s < p.n_slots; s++) lru_push_tail(p, (int32_t) s);
     }
     io_.start(std::max(1, io_threads));
     return true;
 }
 
+// LRU list primitives (O(1)): append as most recently used, unlink, pop least recently used.
 void ExpertStore::lru_push_tail(ExpertPool &p, int32_t slot) {
     p.prev[slot] = p.lru_tail;
     p.next[slot] = -1;
@@ -200,6 +224,11 @@ int32_t ExpertStore::lru_pop_head(ExpertPool &p) {
     return slot;
 }
 
+// For each requested expert:
+//   hit       - already in a slot: pin it (unlinking it from the LRU if it was unpinned);
+//   duplicate - missed earlier in this same call (prefill tokens share experts): reuse that slot;
+//   miss      - evict the LRU head, remap it to this expert, and queue 3 reads (up, gate, down).
+// All reads for the call are in flight together and awaited once at the end.
 bool ExpertStore::acquire(int layer, const int32_t *experts, int n, int32_t *slots, std::string &err) {
     ExpertPool &p = pools_[layer_pool_[layer]];
     const ExpertLayerInfo &li = infos_[layer];
@@ -236,6 +265,7 @@ bool ExpertStore::acquire(int layer, const int32_t *experts, int n, int32_t *slo
                   " slots at once; raise --pool-gib or lower --n-batch";
             return false;
         }
+        // Evict: the slot's previous expert is no longer resident.
         if (p.owner_layer[s] >= 0) slot_of_[(size_t) p.owner_layer[s] * n_expert_ + p.owner_expert[s]] = -1;
         p.owner_layer[s] = layer;
         p.owner_expert[s] = e;
@@ -255,6 +285,7 @@ bool ExpertStore::acquire(int layer, const int32_t *experts, int n, int32_t *slo
     return true;
 }
 
+// Unpin; a slot whose refcount reaches 0 goes to the LRU tail (most recently used).
 void ExpertStore::release_all() {
     for (const auto &[pool_idx, s] : pinned_) {
         ExpertPool &p = pools_[pool_idx];

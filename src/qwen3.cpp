@@ -1,3 +1,9 @@
+// qwen3.cpp - Qwen2/Qwen3/Qwen3-MoE hyperparameters, weight binding, and graph construction.
+//
+// The graph builders call ggml ops that only record nodes; the Engine allocates and runs the graph.
+// Tensor shapes follow ggml's convention: ne[0] is the innermost (contiguous) dimension, so a
+// [n_embd, n_tokens] activation holds one token per column.
+
 #include "qwen3.h"
 
 #include <cmath>
@@ -6,6 +12,7 @@ bool qwen3_is_expert_tensor(const std::string &name) {
     return name.find("_exps.weight") != std::string::npos;
 }
 
+// GGUF keys are prefixed with the architecture name, e.g. "qwen3moe.block_count".
 bool qwen3_load_hparams(const GgufModel &m, Qwen3HParams &hp, std::string &err) {
     if (m.arch != "qwen3" && m.arch != "qwen2" && m.arch != "qwen3moe") {
         err = "unsupported architecture: " + m.arch + " (supported: qwen2, qwen3, qwen3moe)";
@@ -35,6 +42,7 @@ bool qwen3_load_hparams(const GgufModel &m, Qwen3HParams &hp, std::string &err) 
     return true;
 }
 
+// Required-tensor lookup: records the first missing name in `err` so mapping can report it at the end.
 static ggml_tensor *need(const GgufModel &m, const std::string &name, std::string &err) {
     ggml_tensor *t = m.tensor(name);
     if (!t && err.empty()) err = "missing tensor " + name;
@@ -44,6 +52,7 @@ static ggml_tensor *need(const GgufModel &m, const std::string &name, std::strin
 bool qwen3_map_weights(const GgufModel &m, Qwen3HParams &hp, Qwen3Weights &w, bool stream_experts, std::string &err) {
     w.tok_embd = need(m, "token_embd.weight", err);
     w.output_norm = need(m, "output_norm.weight", err);
+    // Small models tie the output projection to the embedding matrix.
     w.output = m.tensor("output.weight");
     if (!w.output) w.output = w.tok_embd;
     w.layers.assign(hp.n_layer, Qwen3Layer{});
@@ -79,6 +88,7 @@ bool qwen3_map_weights(const GgufModel &m, Qwen3HParams &hp, Qwen3Weights &w, bo
     return true;
 }
 
+// Validates expert shapes against the hyperparameters, since the ExpertStore computes byte offsets from them.
 bool qwen3_expert_infos(const GgufModel &m, const Qwen3HParams &hp, std::vector<ExpertLayerInfo> &infos, std::string &err) {
     infos.assign(hp.n_layer, ExpertLayerInfo{});
     for (uint32_t l = 0; l < hp.n_layer; l++) {
@@ -98,15 +108,23 @@ bool qwen3_expert_infos(const GgufModel &m, const Qwen3HParams &hp, std::vector<
     return true;
 }
 
+// RMSNorm then elementwise scale by the learned weight.
 static ggml_tensor *rms(ggml_context *ctx, ggml_tensor *x, ggml_tensor *w, float eps) {
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
 }
 
+// Linear projection with optional bias (Qwen2 has Q/K/V biases).
 static ggml_tensor *proj(ggml_context *ctx, ggml_tensor *w, ggml_tensor *b, ggml_tensor *x) {
     ggml_tensor *y = ggml_mul_mat(ctx, w, x);
     return b ? ggml_add(ctx, y, b) : y;
 }
 
+// Attention sub-block for layer l, including the residual add. Steps:
+//   1. RMSNorm, project to Q (n_head heads) and K, V (n_head_kv heads), optional per-head QK-norm (Qwen3).
+//   2. RoPE: rotate Q and K by each token's position so attention scores depend on relative distance.
+//   3. Write this step's K and V into their KV cache cells (in.kv_idxs).
+//   4. Flash attention of Q over the first n_kv cache cells, with the mask hiding other sequences
+//      and future positions; then the output projection.
 static ggml_tensor *attn_block(ggml_context *ctx, ggml_cgraph *gf, const Qwen3HParams &hp, const Qwen3Layer &L, const KvCache &kv,
                                uint32_t l, ggml_tensor *x, const Qwen3StepInputs &in, int n_tokens, int n_kv) {
     const int64_t hd = hp.head_dim;
@@ -120,16 +138,22 @@ static ggml_tensor *attn_block(ggml_context *ctx, ggml_cgraph *gf, const Qwen3HP
     ggml_tensor *v = ggml_reshape_3d(ctx, proj(ctx, L.wv, L.bv, h), hd, nkv, n_tokens);
     if (L.q_norm) q = rms(ctx, q, L.q_norm, hp.rms_eps);
     if (L.k_norm) k = rms(ctx, k, L.k_norm, hp.rms_eps);
+    // NEOX-style RoPE (rotates the two halves of each head), no context extension: freq_scale 1,
+    // ext_factor 0; the YaRN beta values (32, 1) are inert when ext_factor is 0.
     q = ggml_rope_ext(ctx, q, in.pos, nullptr, (int) hd, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_train, hp.rope_freq_base, 1.0f, 0.0f,
                       1.0f, 32.0f, 1.0f);
     k = ggml_rope_ext(ctx, k, in.pos, nullptr, (int) hd, GGML_ROPE_TYPE_NEOX, (int) hp.n_ctx_train, hp.rope_freq_base, 1.0f, 0.0f,
                       1.0f, 32.0f, 1.0f);
 
+    // set_rows scatters each token's K/V row into its cache column; these nodes must be in the graph
+    // explicitly because nothing downstream consumes their result.
     ggml_tensor *k_rows = ggml_view_2d(ctx, k, hd * nkv, n_tokens, k->nb[2], 0);
     ggml_tensor *v_rows = ggml_view_2d(ctx, v, hd * nkv, n_tokens, v->nb[2], 0);
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, kv.k[l], k_rows, in.kv_idxs));
     ggml_build_forward_expand(gf, ggml_set_rows(ctx, kv.v[l], v_rows, in.kv_idxs));
 
+    // View the cache as [head_dim, n_head_kv, n_kv] and permute to the [head_dim, n_kv, heads] layout
+    // flash attention expects. GQA head sharing is handled inside the kernel.
     const size_t row_head = ggml_row_size(kv.type, hd);
     const size_t row_all = ggml_row_size(kv.type, hd * nkv);
     ggml_tensor *K = ggml_view_3d(ctx, kv.k[l], hd, nkv, n_kv, row_head, row_all, 0);
@@ -139,22 +163,27 @@ static ggml_tensor *attn_block(ggml_context *ctx, ggml_cgraph *gf, const Qwen3HP
     V = ggml_permute(ctx, V, 0, 2, 1, 3);
 
     ggml_tensor *attn = ggml_flash_attn_ext(ctx, Q, K, V, in.mask, kq_scale, 0.0f, 0.0f);
+    // Accumulate in fp32 even though K/V are fp16, for parity with llama.cpp.
     ggml_prec_set_acc(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(ctx, attn, hd * nh, n_tokens);
     ggml_tensor *o = ggml_mul_mat(ctx, L.wo, attn);
     return ggml_add(ctx, o, x);
 }
 
+// MoE router: softmax over all experts' scores, keep the top-k, and renormalize their probabilities to
+// sum to 1 (Qwen3-MoE's norm_topk_prob). Outputs expert ids [k, n_tokens] and weights [1, k, n_tokens].
 static void router(ggml_context *ctx, ggml_cgraph *gf, const Qwen3HParams &hp, const Qwen3Layer &L, ggml_tensor *hnorm,
                    int n_tokens, ggml_tensor **selected_out, ggml_tensor **weights_out) {
     const int64_t k = hp.n_expert_used;
     ggml_tensor *logits = ggml_mul_mat(ctx, L.ffn_gate_inp, hnorm);
     ggml_tensor *probs = ggml_soft_max(ctx, logits);
     ggml_tensor *selected = ggml_argsort_top_k(ctx, probs, (int) k);
+    // The CPU reads the ids back (trace / streaming), so keep them (and their source) from being overwritten.
     ggml_set_output(selected);
     if (selected->view_src) ggml_set_output(selected->view_src);
     ggml_tensor *weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, hp.n_expert, n_tokens), selected);
     weights = ggml_reshape_2d(ctx, weights, k, n_tokens);
+    // Clamp the denominator to the smallest normal fp16 (2^-14) to avoid dividing by ~0.
     ggml_tensor *sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights), 6.103515625e-5f, INFINITY);
     weights = ggml_reshape_3d(ctx, ggml_div(ctx, weights, sum), 1, k, n_tokens);
     ggml_build_forward_expand(gf, weights);
@@ -162,6 +191,9 @@ static void router(ggml_context *ctx, ggml_cgraph *gf, const Qwen3HParams &hp, c
     *weights_out = weights;
 }
 
+// Runs the chosen experts: mul_mat_id multiplies each token by the expert matrices named in `ids`
+// (expert numbers in resident mode, pool slot numbers in streaming mode), applies SwiGLU, then sums
+// the k expert outputs weighted by the router probabilities.
 static ggml_tensor *moe_apply(ggml_context *ctx, ggml_tensor *up, ggml_tensor *gate, ggml_tensor *down, ggml_tensor *hnorm,
                               ggml_tensor *ids, ggml_tensor *weights, int rows, int64_t k) {
     const int64_t n_embd = hnorm->ne[0];
@@ -176,10 +208,12 @@ static ggml_tensor *moe_apply(ggml_context *ctx, ggml_tensor *up, ggml_tensor *g
         ggml_tensor *view = ggml_view_2d(ctx, experts, n_embd, rows, experts->nb[2], i * experts->nb[1]);
         out = out ? ggml_add(ctx, out, view) : view;
     }
+    // With k == 1 `out` is still a strided view; make it contiguous for the residual add.
     if (k == 1) out = ggml_cont(ctx, out);
     return out;
 }
 
+// Dense SwiGLU feed-forward: down(silu(gate(x)) * up(x)).
 static ggml_tensor *dense_ffn(ggml_context *ctx, const Qwen3Layer &L, ggml_tensor *hnorm) {
     ggml_tensor *gate = ggml_mul_mat(ctx, L.ffn_gate, hnorm);
     ggml_tensor *up = ggml_mul_mat(ctx, L.ffn_up, hnorm);
@@ -197,6 +231,7 @@ ggml_cgraph *qwen3_build_graph(ggml_context *ctx, size_t graph_size, const Qwen3
         const Qwen3Layer &L = w.layers[l];
         x = attn_block(ctx, gf, hp, L, kv, l, x, in, n_tokens, n_kv);
         int rows = n_tokens;
+        // After the last attention, only the last token's row matters; skip the FFN for all other rows.
         if (l == hp.n_layer - 1) {
             x = ggml_get_rows(ctx, x, in.out_ids);
             rows = 1;
@@ -238,6 +273,8 @@ ggml_cgraph *qwen3_build_segment(ggml_context *ctx, size_t graph_size, const Qwe
     *logits_out = nullptr;
 
     ggml_tensor *x = nullptr;
+    // Front half: finish layer moe_layer by running its experts on the state saved by the previous segment.
+    // `ids` is a graph input the CPU fills with pool slot numbers after it has loaded the experts.
     if (moe_layer >= 0) {
         ggml_tensor *resid = ggml_view_2d(ctx, p.resid, n_embd, rows, p.resid->nb[1], row_off * p.resid->nb[1]);
         ggml_tensor *hn = ggml_view_2d(ctx, p.hnorm, n_embd, rows, p.hnorm->nb[1], row_off * p.hnorm->nb[1]);
@@ -252,6 +289,8 @@ ggml_cgraph *qwen3_build_segment(ggml_context *ctx, size_t graph_size, const Qwe
         x = ggml_get_rows(ctx, w.tok_embd, in.tokens);
     }
 
+    // Back half: attention and router of attn_layer. The expert step can't run here because the CPU must
+    // first see `selected`, so the state it needs is copied into the persistent tensors for the next segment.
     if (!final) {
         const Qwen3Layer &L = w.layers[attn_layer];
         x = attn_block(ctx, gf, hp, L, kv, (uint32_t) attn_layer, x, in, n_tokens, n_kv);

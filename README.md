@@ -40,4 +40,5 @@ Supported architectures so far: qwen2, qwen3 (dense), qwen3moe (resident or stre
 - `tools/cache_sim.py` replays a routing trace against expert-cache policies.
 - `tools/fetch_models.sh` downloads the GGUF files used by the plan with resume support.
 - `tools/make_tiny_moe.py` writes a synthetic Qwen3-MoE GGUF; `tools/test_streaming.sh` checks streaming against resident logits with it.
+- `tools/code_eval.py` scores any OpenAI-compatible endpoint (`lstk --serve`, or a hosted flagship via OpenRouter) on HumanEval+ / MBPP+ coding problems, running answers in a sandbox; `--compare` puts runs side by side.
 - `tools/moe_check.sh` runs the streaming self-consistency, trace, simulator, and speed sweep on a real MoE GGUF into `docs/runs/`.

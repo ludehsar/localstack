@@ -1,10 +1,15 @@
+// engine.cpp - Engine implementation: backend setup, memory sizing, and the per-step forward pass.
+//
+// A decode() call splits its tokens into n_batch chunks; each chunk is one step(). A step reserves KV
+// cells, uploads the step inputs, then either runs one whole-model graph (resident) or walks the
+// layers as a chain of graph segments, loading routed experts from SSD between segments (streaming).
+
 #include "engine.h"
 
 #include "ggml-cpu.h"
 #include "memory_monitor.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 
 Engine::~Engine() {
@@ -18,12 +23,17 @@ Engine::~Engine() {
     if (cpu_) ggml_backend_free(cpu_);
 }
 
+// Routing trace format (read by tools/cache_sim.py), all little-endian int32:
+//   "LSTKRTE1", n_layer, n_expert, n_expert_used,
+//   then per step: n_tokens, then per layer n_tokens * n_expert_used expert ids (-1 = not computed).
 static const char TRACE_MAGIC[8] = { 'L', 'S', 'T', 'K', 'R', 'T', 'E', '1' };
 
 bool Engine::load(const EngineParams &params, std::string &err) {
     params_ = params;
     const int64_t t0 = ggml_time_us();
 
+    // Find the Metal GPU device and the CPU device. Weights, KV, and most ops go on the GPU; the
+    // scheduler falls back to the CPU for any op the GPU backend does not support.
     ggml_backend_load_all();
     ggml_backend_dev_t cpu_dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
@@ -54,12 +64,14 @@ bool Engine::load(const EngineParams &params, std::string &err) {
 
     if (!model_.open(params.model_path, err)) return false;
     if (!qwen3_load_hparams(model_, hp_, err)) return false;
+    // In streaming mode the expert tensors are skipped here and served from the ExpertStore instead.
     stream_ = params.stream_experts && hp_.moe();
     stats_.streaming = stream_;
     if (!model_.load_all(gpu_, err, stream_ ? qwen3_is_expert_tensor : std::function<bool(const std::string &)>())) return false;
     if (!qwen3_map_weights(model_, hp_, w_, stream_, err)) return false;
     stats_.weight_bytes = model_.loaded_bytes();
 
+    // KV cache in fp16, sized to n_ctx rounded up to the 256-cell padding used by n_kv_for().
     const uint32_t kv_size = (params.n_ctx + 255) / 256 * 256;
     if (!kv_.init(gpu_, hp_.n_layer, hp_.n_embd_k_gqa(), hp_.n_embd_v_gqa(), kv_size, GGML_TYPE_F16, err)) return false;
     stats_.kv_bytes = kv_.bytes();
@@ -69,6 +81,11 @@ bool Engine::load(const EngineParams &params, std::string &err) {
         size_t table = 0;
         for (const ExpertLayerInfo &li : infos_) table += li.up.nbytes + li.gate.nbytes + li.down.nbytes;
         stats_.expert_table_bytes = table;
+        // Expert pool size. Unless --pool-gib is given, take the smallest of:
+        //   by_table - 45% of all expert bytes (the upper clamp from docs/plan.md section 5.7),
+        //   by_cap   - Metal working-set cap minus weights, KV, and 1.5 GiB of compute headroom,
+        //   by_free  - free + inactive RAM right now minus a 3 GiB floor left for the OS page cache,
+        //              so the pool never pushes macOS into compression or swap.
         size_t pool_bytes = (size_t) (params.pool_gib * 1073741824.0);
         if (pool_bytes == 0) {
             const double by_table = 0.45 * (double) table;
@@ -91,15 +108,20 @@ bool Engine::load(const EngineParams &params, std::string &err) {
                         pool_bytes / 1073741824.0);
             }
         }
+        // Clamp. ExpertStore::init still raises each pool to its minimum slot count, so a tiny value is safe.
         pool_bytes = std::max<size_t>(pool_bytes, 16u << 10);
         pool_bytes = std::min<size_t>(pool_bytes, (size_t) 9 << 30);
+        // Minimum slots per pool: a full layer's experts, because a prefill batch can route to all of them at once.
         if (!store_.init(gpu_dev_, gpu_, model_.fd, hp_.n_layer, hp_.n_expert, hp_.n_embd, hp_.n_ff_exp, infos_, pool_bytes,
                          std::max(hp_.n_expert, 2 * hp_.n_expert_used + 2), params.io_threads, err)) {
             return false;
         }
         stats_.pool_bytes = store_.total_bytes();
         stats_.pool_slots = store_.total_slots();
+        if (params.verbose) fprintf(stderr, "expert pools:\n%s", store_.describe().c_str());
 
+        // Activations that cross a segment boundary, sized for a full n_batch chunk. They live in their own
+        // GPU buffer because the scheduler's compute buffers are reused (overwritten) by every graph.
         ggml_init_params pp = { ggml_tensor_overhead() * 4, nullptr, true };
         persist_ctx_ = ggml_init(pp);
         persist_.resid = ggml_new_tensor_2d(persist_ctx_, GGML_TYPE_F32, hp_.n_embd, params.n_batch);
@@ -115,6 +137,8 @@ bool Engine::load(const EngineParams &params, std::string &err) {
         }
     }
 
+    // Build the largest graph we will ever run (n_batch tokens attending over the whole cache) once, so
+    // the scheduler sizes its compute buffers up front and later steps never reallocate.
     graph_mem_size_ = ggml_tensor_overhead() * graph_size_ * 2 + ggml_graph_overhead_custom(graph_size_, false);
     ggml_backend_t backends[2] = { gpu_, cpu_ };
     sched_ = ggml_backend_sched_new(backends, nullptr, 2, graph_size_, false, true);
@@ -164,11 +188,15 @@ void Engine::write_trace_layer(const int32_t *ids, int n_tokens) {
     fwrite(ids, sizeof(int32_t), (size_t) hp_.n_expert_used * n_tokens, trace_);
 }
 
+// Attention only needs to scan cells [0, used_hwm). Padding to 256 (at least 256, at most the cache size)
+// keeps the number of distinct graph shapes small; the mask hides the padding cells.
 int Engine::n_kv_for(int n_total) const {
     const int padded = (n_total + 255) / 256 * 256;
     return std::min<int>((int) kv_.size, std::max(256, padded));
 }
 
+// Reserves KV cells for `tokens` in `seq` and uploads the step's input tensors to the GPU.
+// seq < 0 is the load-time dry run: shapes only, no KV allocation and no data.
 bool Engine::make_step_inputs(int32_t seq, const int32_t *tokens, int n_tokens, int n_kv, std::string &err) {
     free_step_inputs();
     std::vector<int64_t> cells(n_tokens);
@@ -204,6 +232,7 @@ bool Engine::make_step_inputs(int32_t seq, const int32_t *tokens, int n_tokens, 
     if (seq < 0) return true;
     std::vector<ggml_fp16_t> mask((size_t) n_kv * n_tokens);
     kv_.fill_mask(seq, pos.data(), n_tokens, n_kv, mask.data());
+    // Only the last token's logits are needed to pick the next token.
     const int32_t out_id = n_tokens - 1;
     ggml_backend_tensor_set(in_.tokens, tokens, 0, sizeof(int32_t) * n_tokens);
     ggml_backend_tensor_set(in_.pos, pos.data(), 0, sizeof(int32_t) * n_tokens);
@@ -221,6 +250,7 @@ void Engine::free_step_inputs() {
     in_ = Qwen3StepInputs{};
 }
 
+// Public entry point. Long prompts are split into n_batch chunks; only the last chunk's logits survive.
 bool Engine::decode(int32_t seq, const int32_t *tokens, int n_tokens, std::vector<float> &logits, std::string &err) {
     const int64_t t0 = ggml_time_us();
     for (int done = 0; done < n_tokens;) {
@@ -241,12 +271,14 @@ bool Engine::step(int32_t seq, const int32_t *tokens, int n_tokens, std::vector<
     return ok;
 }
 
+// Copies the router's chosen expert ids ([k, rows] int32 on the GPU, possibly strided) into `dst`.
 static void read_selected(ggml_tensor *sel, int rows, int k, int32_t *dst) {
     for (int t = 0; t < rows; t++) {
         ggml_backend_tensor_get(sel, dst + (size_t) t * k, (size_t) t * sel->nb[1], sizeof(int32_t) * k);
     }
 }
 
+// Resident path: build the full-model graph, let the scheduler place and run it, read back the logits.
 bool Engine::step_resident(int n_tokens, int n_kv, std::vector<float> &logits, std::string &err) {
     ggml_init_params gp = { graph_mem_size_, nullptr, true };
     ggml_context *ctx = ggml_init(gp);
@@ -270,6 +302,7 @@ bool Engine::step_resident(int n_tokens, int n_kv, std::vector<float> &logits, s
         const int32_t n = n_tokens;
         fwrite(&n, sizeof(int32_t), 1, trace_);
         std::vector<int32_t> ids((size_t) hp_.n_expert_used * n_tokens);
+        // The last layer only runs its FFN for the output row, so its trace has one real row and -1 elsewhere.
         for (ggml_tensor *sel : selected) {
             const int rows = (int) sel->ne[1];
             std::fill(ids.begin(), ids.end(), -1);
@@ -286,6 +319,10 @@ bool Engine::step_resident(int n_tokens, int n_kv, std::vector<float> &logits, s
     return true;
 }
 
+// Streaming path. For L layers the step runs L + 1 segments:
+//   [embed + attn/router 0], [experts 0 + attn/router 1], ..., [experts L-1 + output head]
+// After each segment the CPU reads which experts were selected, so run_segment can load them before
+// the next segment, which is the one that uses them.
 bool Engine::step_streaming(int n_tokens, int n_kv, std::vector<float> &logits, std::string &err) {
     if (trace_) {
         const int32_t n = n_tokens;
@@ -301,6 +338,8 @@ bool Engine::step_streaming(int n_tokens, int n_kv, std::vector<float> &logits, 
     return true;
 }
 
+// Builds and runs one segment. Between graph allocation and compute, the CPU translates the previous
+// router's expert ids into pool slots (loading misses from the SSD) and uploads them as `slot_ids`.
 bool Engine::run_segment(int moe_layer, int attn_layer, int n_tokens, int n_kv, std::vector<int32_t> &selected,
                          std::vector<float> *logits, std::string &err) {
     const int64_t t0 = ggml_time_us();
@@ -324,6 +363,7 @@ bool Engine::run_segment(int moe_layer, int attn_layer, int n_tokens, int n_kv, 
         return false;
     }
     if (slot_ids) {
+        // The final segment only computes the last token, so only its row of expert ids is needed.
         const int rows = attn_layer < 0 ? 1 : n_tokens;
         const int32_t *experts = selected.data() + (attn_layer < 0 ? (size_t) (n_tokens - 1) * k : 0);
         std::vector<int32_t> slots((size_t) k * rows);
@@ -334,8 +374,10 @@ bool Engine::run_segment(int moe_layer, int attn_layer, int n_tokens, int n_kv, 
         }
         ggml_backend_tensor_set(slot_ids, slots.data(), 0, slots.size() * sizeof(int32_t));
     }
+    // Everything up to here (graph build, allocation, expert I/O) is per-segment overhead.
     const int64_t t1 = ggml_time_us();
     const ggml_status st = ggml_backend_sched_graph_compute(sched_, gf);
+    // Compute is synchronous, so the experts are no longer needed and can become eviction candidates.
     store_.release_all();
     if (st != GGML_STATUS_SUCCESS) {
         ggml_free(ctx);

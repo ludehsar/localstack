@@ -1,3 +1,5 @@
+// kv_cache.cpp - KV cache allocation and block/cell bookkeeping. See kv_cache.h for the layout.
+
 #include "kv_cache.h"
 
 #include <cmath>
@@ -26,11 +28,13 @@ bool KvCache::init(ggml_backend_t backend, uint32_t n_layer, uint32_t n_embd_k_g
         err = "failed to allocate the KV cache";
         return false;
     }
+    // Zero the cache: masked cells are multiplied by 0 attention weight, and stale NaNs would still poison that.
     ggml_backend_buffer_clear(buffer, 0);
 
     cell_seq.assign(size, -1);
     cell_pos.assign(size, -1);
     free_blocks.clear();
+    // Push in reverse so pop_back() hands out block 0 first, keeping used cells packed low (small used_hwm).
     for (uint32_t b = size / block_size; b > 0; b--) free_blocks.push_back(b - 1);
     seq_blocks.clear();
     seq_len.clear();
@@ -51,6 +55,7 @@ size_t KvCache::bytes() const {
     return buffer ? ggml_backend_buffer_get_size(buffer) : 0;
 }
 
+// Grows the sequence's block list as needed, then assigns cells for positions len .. len + n_tokens - 1.
 bool KvCache::alloc(int32_t seq, int n_tokens, std::vector<int64_t> &cells, std::vector<int32_t> &positions) {
     int32_t &len = seq_len[seq];
     std::vector<uint32_t> &blocks = seq_blocks[seq];
@@ -65,6 +70,7 @@ bool KvCache::alloc(int32_t seq, int n_tokens, std::vector<int64_t> &cells, std:
     cells.resize(n_tokens);
     positions.resize(n_tokens);
     for (int i = 0; i < n_tokens; i++) {
+        // Block-table lookup: position -> (block index, offset in block) -> physical cell.
         const uint32_t cell = blocks[(uint32_t) len / block_size] * block_size + (uint32_t) len % block_size;
         cell_seq[cell] = seq;
         cell_pos[cell] = len;
@@ -76,6 +82,8 @@ bool KvCache::alloc(int32_t seq, int n_tokens, std::vector<int64_t> &cells, std:
     return true;
 }
 
+// Frees all of a sequence's blocks. The high-water mark is recomputed by a linear scan.
+// ponytail: O(size) scan per removal; track per-block occupancy if this ever shows in profiles.
 void KvCache::remove_seq(int32_t seq) {
     auto it = seq_blocks.find(seq);
     if (it == seq_blocks.end()) return;
@@ -94,6 +102,8 @@ void KvCache::remove_seq(int32_t seq) {
     }
 }
 
+// Keeps positions [0, keep) and frees the rest, returning whole unused blocks to the free list.
+// The server uses this to reuse the cached prefix shared with the next request.
 void KvCache::truncate_seq(int32_t seq, int32_t keep) {
     auto it = seq_blocks.find(seq);
     if (it == seq_blocks.end()) return;
@@ -126,6 +136,7 @@ int32_t KvCache::length(int32_t seq) const {
     return it == seq_len.end() ? 0 : it->second;
 }
 
+// See kv_cache.h. Columns beyond used_hwm (padding) are always hidden since their cell_seq is -1.
 void KvCache::fill_mask(int32_t seq, const int32_t *pos, int n_tokens, int n_kv, ggml_fp16_t *mask) const {
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);

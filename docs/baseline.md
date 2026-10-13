@@ -97,3 +97,45 @@ On the Q8_0 Qwen3 model the logits are identical to llama.cpp; the 0.007 spread 
 Q4_K_M file comes from the Q4_K matmul kernel path, not from the graph. Decode is 6% behind
 llama.cpp on this small model because per-step fixed costs (graph build, allocation, mask fill,
 read-back) are a larger share of a 16 ms step; graph reuse is a Phase 5 item.
+
+## Phase 4 on the real model: Qwen3-30B-A3B UD-Q2_K_XL, streamed (2026-10-11)
+
+First run on a real MoE file (11.8 GB). The whole run happened on a starved machine: 0.05 to
+0.15 GiB free, 4 GiB compressed, 1 to 2 GiB of swap in use, 6k to 16k decompressions per second
+while the engine ran. Every number below is therefore a floor; the resident run and the llama.cpp
+baseline were skipped because the script requires 13 GiB available for this file. Full output in
+docs/runs/Qwen3-30B-A3B-UD-Q2_K_XL.md.
+
+Correctness: greedy top-3 logits over 25 steps are identical between a 1 GiB pool and a 2.5 GiB
+pool (different eviction histories, same numbers). Streaming is exact on the real model.
+
+Decode by pool size (`--bench 64 48 --stream-experts`, Q2_K/Q3_K experts, slab 1.63 to 1.83 MiB):
+
+| Pool | Hit rate | Read per layer-step | I/O wait per segment | Decode | Prefill |
+|---|---|---|---|---|---|
+| 1 GiB | 73.2% | 10.1 MiB | 2.34 ms | 8.21 tok/s | 47.7 tok/s |
+| 2 GiB | 80.8% | 7.3 MiB | 2.04 ms | 10.85 tok/s | 39.1 tok/s |
+| 3 GiB | 84.6% | 5.8 MiB | 1.87 ms | 12.22 tok/s | 38.5 tok/s |
+| 4 GiB | 87.7% | 4.7 MiB | 1.51 ms | 14.55 tok/s | 50.1 tok/s |
+
+Routing trace (218 tokens, temp 0.8) through `tools/cache_sim.py`: consecutive tokens share 40.6%
+of their experts per layer; the hottest 25% of experts take 71.2% of loads, the hottest 50% take
+94.5%. Simulated LRU hit rate: 76% at 32 slots per layer, 86.5% at 48, 91.5% at 64; Belady's
+ceiling is 87% at 32 and 94% at 64. LFU with decay never beats LRU on this trace. The measured
+4 GiB run (about 51 slots per layer) landed at 87.7%, within a point of the simulator.
+
+What the numbers say:
+
+- At 4 GiB the engine reads about 226 MB per token (4.7 MiB x 48 layers) in 68.7 ms, which is
+  3.3 GB/s, close to the 4.3 GB/s this SSD delivers at two threads. Decode is SSD bound; hit rate
+  is the whole game, exactly as the design predicted.
+- The per-segment overhead (1.5 to 2.5 ms, 49 segments per token) is almost entirely I/O wait.
+  CPU-side bookkeeping is in the noise.
+- Prefill at 40 to 50 tok/s under streaming matches the community's 50 to 80 tok/s range.
+- The Phase 4 gate (8 tok/s steady state) is met at every pool size from 1 GiB up, and the
+  4 GiB pool is already at the low end of the 12 to 20 tok/s calibration from llama.cpp
+  discussion #23324, on a machine with no free memory.
+
+Bug found and fixed by this run: ggml's Metal `mul_mat_id` prefill path assigns one thread per
+expert of the weight tensor and asserts `ne02 <= 1024`. Pool tensors are now sharded so no pool
+holds more than 1024 slots (see docs/decisions.md).
